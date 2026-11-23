@@ -144,4 +144,3 @@ if (errors.length) {
   }
 }
 console.log(`screenshots written to ${OUT}`);
-await writeFile(join(OUT, '.shots-ok'), new Date().toISOString());
