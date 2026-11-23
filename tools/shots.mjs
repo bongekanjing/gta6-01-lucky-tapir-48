@@ -17,7 +17,7 @@ import { chromium } from '/root/makefun/shotenv/node_modules/playwright-core/ind
 const here = fileURLToPath(new URL('..', import.meta.url));
 const ROOT = resolve(join(here, 'game'));
 const OUT = resolve(join(here, process.argv.includes('--out') ? process.argv[process.argv.indexOf('--out') + 1] : 'screenshots'));
-const CHROME = '/root/.cache/ms-playwright/chromium-1148/chrome-linux/chrome';
+const CHROME = process.env.MAKEFUN_CHROME || '/root/.hermes/tools/chromium-1208/chrome-linux64/chrome';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',

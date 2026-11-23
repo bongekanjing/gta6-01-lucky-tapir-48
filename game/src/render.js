@@ -1153,6 +1153,22 @@ function drawPlayer(ctx, world, view, t) {
   const blink = p.invuln > 0 && Math.sin(p.invuln * 60) > 0.2;
   ctx.save();
   ctx.translate(p.x, p.y);
+  // A spotlight ring on the pavement, under everything else: this is what the eye catches
+  // first among the crowd, so the player is findable in one glance.
+  const ringPulse = 1 + Math.sin(t * 3.4) * 0.06;
+  const ringGlow = ctx.createRadialGradient(0, 2, 4, 0, 2, 22 * ringPulse);
+  ringGlow.addColorStop(0, 'rgba(255,194,74,0.30)');
+  ringGlow.addColorStop(0.55, 'rgba(255,194,74,0.14)');
+  ringGlow.addColorStop(1, 'rgba(255,194,74,0)');
+  ctx.fillStyle = ringGlow;
+  ctx.beginPath();
+  ctx.ellipse(0, 2, 22 * ringPulse, 14 * ringPulse, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#FFC24A';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.ellipse(0, 2, 15, 8.5, 0, 0, Math.PI * 2);
+  ctx.stroke();
   if (blink) ctx.globalAlpha = 0.55;
   // Shadow.
   ctx.fillStyle = 'rgba(18,22,30,0.34)';
@@ -1177,6 +1193,10 @@ function drawPlayer(ctx, world, view, t) {
   ctx.beginPath();
   ctx.ellipse(0, -3, 7, 8.6, 0, 0, Math.PI * 2);
   ctx.fill();
+  // A near-white rim on the jacket so the silhouette separates from the crowd at small size.
+  ctx.strokeStyle = '#FFF6E2';
+  ctx.lineWidth = 2;
+  ctx.stroke();
   ctx.fillStyle = '#8d4a3a';
   ctx.beginPath();
   ctx.moveTo(-5, -8);
