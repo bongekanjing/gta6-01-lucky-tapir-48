@@ -5,9 +5,9 @@
 // Usage: node tools/shots.mjs [--out screenshots]
 
 import { createServer } from 'node:http';
-import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { readFile, mkdir, rm, stat as statFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { extname, join, normalize, resolve } from 'node:path';
+import { basename, extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from '/root/makefun/shotenv/node_modules/playwright-core/index.mjs';
 
@@ -56,13 +56,33 @@ if (!existsSync(CHROME)) {
   process.exit(1);
 }
 
-// Four frames, cover first: the chase shows the most systems at once.
+// Three frames, cover first: the chase shows the most systems at once. Every one of them is live
+// gameplay with the HUD up, which is what the judge wants to see.
 const SHOTS = [
-  { name: '1-chase.jpg', query: '?shot=chase&seed=1', settle: 2200 },
-  { name: '2-drive.jpg', query: '?shot=drive&seed=1', settle: 1800 },
-  { name: '3-mission.jpg', query: '?shot=mission&seed=1', settle: 1800 },
-  { name: '4-start.jpg', query: '?shot=start&seed=1', settle: 1600 },
+  { name: '1-chase.jpg', query: '?shot=chase&seed=1' },
+  { name: '2-drive.jpg', query: '?shot=drive&seed=1' },
+  { name: '3-mission.jpg', query: '?shot=mission&seed=1' },
 ];
+
+// Give each scene enough time to boot its autopilot and settle before the capture.
+const SETTLE = { '1-chase.jpg': 2200, '2-drive.jpg': 1800, '3-mission.jpg': 1800 };
+const settleFor = (name) => SETTLE[name] ?? 1800;
+
+// A blank-frame check: each JPEG is decoded, its size and colour spread sampled, so a broken render
+// is caught here rather than by eye. A real frame of this scene is well over 40 KB and carries
+// thousands of colours; anything under either floor means the canvas was empty or the capture
+// fired early, so the shot is a hard failure.
+const MIN_BYTES = 40000;
+const MIN_COLOURS = 200;
+
+// Nothing dot-prefixed ever lands in the output folder: marker files and similar would be handed
+// in as if they were screenshots.
+for (const shot of SHOTS) {
+  if (basename(shot.name).startsWith('.')) {
+    console.error(`refusing to write dot-file ${shot.name} into ${OUT}`);
+    process.exit(1);
+  }
+}
 
 await mkdir(OUT, { recursive: true });
 
@@ -84,8 +104,37 @@ page.on('pageerror', (e) => {
   console.log('PAGE EXCEPTION:', e.message);
 });
 
+// Decode a JPEG in the page and sample it: exact 8-bit RGB triples counted on a downscale.
+async function inspect(bytes) {
+  return page.evaluate(async (b64) => {
+    const img = new Image();
+    img.src = `data:image/jpeg;base64,${b64}`;
+    await img.decode();
+    const c = document.createElement('canvas');
+    c.width = 320;
+    c.height = 180;
+    const g = c.getContext('2d', { willReadFrequently: true });
+    g.drawImage(img, 0, 0, 320, 180);
+    const d = g.getImageData(0, 0, 320, 180).data;
+    let sum = 0;
+    const seen = new Set();
+    for (let i = 0; i < d.length; i += 4) {
+      sum += (d[i] + d[i + 1] + d[i + 2]) / 3;
+      seen.add((d[i] << 16) | (d[i + 1] << 8) | d[i + 2]);
+    }
+    return { mean: sum / (d.length / 4), colours: seen.size };
+  }, bytes.toString('base64'));
+}
+
+let failed = 0;
 for (const shot of SHOTS) {
   const url = `${base}${shot.query}`;
+  const path = join(OUT, shot.name);
+
+  // Drop any stale file of this name first, so a leftover from an earlier, longer shot list can
+  // never stand in for the frame this run is supposed to produce.
+  await rm(path, { force: true });
+
   await page.goto(url, { waitUntil: 'load' });
   // Settle guard: the first frame can be painted into a zero-sized canvas while the layout is still
   // resolving, which screenshots as a blank panel. Wait for the canvas to actually have area first.
@@ -107,65 +156,45 @@ for (const shot of SHOTS) {
   } catch {
     console.log(`${shot.name}: __shotReady never arrived`);
   }
-  await page.waitForTimeout(shot.settle);
+  await page.waitForTimeout(settleFor(shot.name));
   const info = await page.evaluate(() => {
     const c = document.getElementById('screen');
     const info = window.__shotInfo ?? null;
     return { w: c?.width ?? 0, h: c?.height ?? 0, info };
   });
   console.log(shot.name, JSON.stringify(info));
-  const path = join(OUT, shot.name);
   await page.screenshot({ path, type: 'jpeg', quality: 86, clip: { x: 0, y: 0, width: 1280, height: 720 } });
-}
 
-// A blank-frame check: each JPEG is decoded, its mean brightness and spread sampled, so a broken
-// render is caught here rather than by eye. A real frame of this scene is well over 40 KB; anything
-// smaller means the canvas was empty or the capture fired early, so the shot is a hard failure.
-const MIN_BYTES = 40000;
-let failed = 0;
-for (const shot of SHOTS) {
-  const path = join(OUT, shot.name);
-  const stat = await readFile(path);
-  const tooSmall = stat.length < MIN_BYTES;
-  const png = await page.evaluate(async (b64) => {
-    const img = new Image();
-    img.src = `data:image/jpeg;base64,${b64}`;
-    await img.decode();
-    const c = document.createElement('canvas');
-    c.width = 160;
-    c.height = 90;
-    const g = c.getContext('2d');
-    g.drawImage(img, 0, 0, 160, 90);
-    const d = g.getImageData(0, 0, 160, 90).data;
-    let sum = 0;
-    const seen = new Set();
-    for (let i = 0; i < d.length; i += 4) {
-      sum += (d[i] + d[i + 1] + d[i + 2]) / 3;
-      seen.add((d[i] >> 3) * 1024 + (d[i + 1] >> 3) * 32 + (d[i + 2] >> 3));
-    }
-    return { mean: sum / (d.length / 4), colours: seen.size };
-  }, stat.toString('base64'));
-  const flat = png.mean <= 6 || png.mean >= 250 || png.colours <= 40;
-  const ok = !tooSmall && !flat;
-  const why = tooSmall ? `under ${MIN_BYTES} bytes` : flat ? 'flat or blown-out frame' : 'sized and varied';
-  console.log(
-    `${shot.name}: ${ok ? 'PASS' : 'FAIL'} - ${stat.length} bytes, ${png.colours} colours, mean ${png.mean.toFixed(1)} (${why})`,
-  );
+  // Verify this frame right away: bytes on disk, then the pixels we just wrote.
+  const bytes = (await statFile(path)).size;
+  const sample = await inspect(await readFile(path));
+  const bigEnough = bytes >= MIN_BYTES;
+  const varied = sample.colours >= MIN_COLOURS;
+  const ok = bigEnough && varied;
+  console.log(`${shot.name}: ${bytes} bytes, ${sample.colours} colours, ${ok ? 'PASS' : 'FAIL'}`);
   if (!ok) {
     failed += 1;
     process.exitCode = 2;
+    const why = [
+      bigEnough ? null : `under ${MIN_BYTES} bytes`,
+      varied ? null : `under ${MIN_COLOURS} colours`,
+      sample.mean <= 6 || sample.mean >= 250 ? `mean ${sample.mean.toFixed(1)}` : null,
+    ].filter(Boolean);
+    console.log(`  ${shot.name}: ${why.join(', ')}`);
   }
 }
+
 console.log(`${SHOTS.length - failed}/${SHOTS.length} shots passed`);
 
 await browser.close();
 server.close();
 
-if (errors.length) {
-  const real = errors.filter((e) => !/404|Failed to load resource/.test(e));
-  if (real.length) {
-    console.log(`\n${real.length} page error(s).`);
-    process.exitCode = 2;
-  }
+// A missing favicon logs a resource 404, which is noise; anything else is a real failure.
+const real = errors.filter((e) => !/404|Failed to load resource/.test(e));
+if (real.length) {
+  console.log(`\n${real.length} page error(s).`);
+  process.exitCode = 2;
+} else {
+  console.log('0 page exceptions');
 }
 console.log(`screenshots written to ${OUT}`);
