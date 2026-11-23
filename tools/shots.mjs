@@ -8,7 +8,7 @@
 // Usage: node tools/shots.mjs [--out screenshots]
 
 import { createServer } from 'node:http';
-import { readFile, mkdir, rm, stat as statFile } from 'node:fs/promises';
+import { readFile, mkdir, readdir, rm, stat as statFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { basename, extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -83,6 +83,17 @@ const timingFor = (name) => TIMING[name] ?? { ready: 30000, settle: 1800 };
 const MIN_BYTES = 40000;
 const MIN_COLOURS = 200;
 
+// The competition's own ceilings: a frame wider than 1280 on the long side, thinner than 480 on
+// the short side, or heavier than 256 KiB is rejected by the gate no matter how good it looks, so
+// it is checked before the file is handed over rather than discovered at submission time.
+const MAX_LONG_SIDE = 1280;
+const MIN_SHORT_SIDE = 480;
+const MAX_BYTES = 262144;
+
+// Three is the number the entry ships; four is the competition's cap. Anything else means the rig
+// and the entry have drifted apart, which is a failure rather than a smaller gallery.
+const EXPECTED_SHOTS = [3, 4];
+
 // Nothing dot-prefixed ever lands in the output folder: marker files and similar would be handed
 // in as if they were screenshots.
 for (const shot of SHOTS) {
@@ -113,7 +124,8 @@ page.on('pageerror', (e) => {
   console.log('PAGE EXCEPTION:', e.message);
 });
 
-// Decode a JPEG in the page and sample it: exact 8-bit RGB triples counted on a downscale.
+// Decode a JPEG in the page and sample it: exact 8-bit RGB triples counted on a downscale, plus the
+// true pixel dimensions read off the decoded image rather than trusted from the viewport.
 async function inspect(bytes) {
   return page.evaluate(async (b64) => {
     const img = new Image();
@@ -131,8 +143,27 @@ async function inspect(bytes) {
       sum += (d[i] + d[i + 1] + d[i + 2]) / 3;
       seen.add((d[i] << 16) | (d[i + 1] << 8) | d[i + 2]);
     }
-    return { mean: sum / (d.length / 4), colours: seen.size };
+    return { mean: sum / (d.length / 4), colours: seen.size, width: img.naturalWidth, height: img.naturalHeight };
   }, bytes.toString('base64'));
+}
+
+// Everything the gate will check about one frame, applied to the bytes still in memory so a frame
+// that would be rejected is never written at all: the shot then fails loudly instead of leaving a
+// plausible-looking file behind for the entry to pick up.
+async function vetFrame(buffer) {
+  const bytes = buffer.length;
+  const sample = await inspect(buffer);
+  const longSide = Math.max(sample.width, sample.height);
+  const shortSide = Math.min(sample.width, sample.height);
+  const problems = [
+    bytes < MIN_BYTES ? `under ${MIN_BYTES} bytes` : null,
+    bytes > MAX_BYTES ? `over ${MAX_BYTES} bytes` : null,
+    sample.colours < MIN_COLOURS ? `under ${MIN_COLOURS} colours` : null,
+    longSide > MAX_LONG_SIDE ? `long side ${longSide} over ${MAX_LONG_SIDE}` : null,
+    shortSide < MIN_SHORT_SIDE ? `short side ${shortSide} under ${MIN_SHORT_SIDE}` : null,
+    sample.mean <= 6 || sample.mean >= 250 ? `mean ${sample.mean.toFixed(1)}` : null,
+  ].filter(Boolean);
+  return { bytes, colours: sample.colours, width: sample.width, height: sample.height, problems };
 }
 
 // One row per shot, filled in as the run goes; the summary table is printed from it at the end.
@@ -193,7 +224,21 @@ for (const shot of SHOTS) {
     });
     console.log(shot.name, '__shotInfo', JSON.stringify(info));
 
-    await page.screenshot({ path, type: 'jpeg', quality: 86, clip: { x: 0, y: 0, width: 1280, height: 720 } });
+    const frame = await page.screenshot({ type: 'jpeg', quality: 88, clip: { x: 0, y: 0, width: 1280, height: 720 } });
+
+    // Vet the frame before it ever touches the output folder: a blank or oversized capture fails
+    // here, so no half-good JPEG is left behind for the entry to ship.
+    const verdict = await vetFrame(frame);
+    record.bytes = verdict.bytes;
+    record.colours = verdict.colours;
+    record.dims = `${verdict.width}x${verdict.height}`;
+    if (verdict.problems.length) {
+      throw new Error(`capture rejected: ${verdict.problems.join(', ')}`);
+    }
+
+    await writeFile(path, frame);
+    const onDisk = (await statFile(path)).size;
+    if (onDisk !== frame.length) throw new Error(`wrote ${onDisk} bytes, expected ${frame.length}`);
   } catch (error) {
     // No frame for this shot: drop whatever the capture may have left behind and move on.
     await rm(path, { force: true });
@@ -201,24 +246,8 @@ for (const shot of SHOTS) {
     continue;
   }
 
-  // Verify this frame right away: bytes on disk, then the pixels we just wrote.
-  const bytes = (await statFile(path)).size;
-  const sample = await inspect(await readFile(path));
-  const bigEnough = bytes >= MIN_BYTES;
-  const varied = sample.colours >= MIN_COLOURS;
-  const ok = bigEnough && varied;
-  record.bytes = bytes;
-  record.colours = sample.colours;
-  record.ok = ok;
-  console.log(`${shot.name}: ${bytes} bytes, ${sample.colours} colours, ${ok ? 'PASS' : 'FAIL'}`);
-  if (!ok) {
-    const why = [
-      bigEnough ? null : `under ${MIN_BYTES} bytes`,
-      varied ? null : `under ${MIN_COLOURS} colours`,
-      sample.mean <= 6 || sample.mean >= 250 ? `mean ${sample.mean.toFixed(1)}` : null,
-    ].filter(Boolean);
-    console.log(`  ${shot.name}: ${why.join(', ')}`);
-  }
+  record.ok = true;
+  console.log(`${shot.name}: ${record.bytes} bytes, ${record.colours} colours, ${record.dims}, PASS`);
 }
 
 const passed = results.filter((r) => r.ok).length;
@@ -226,15 +255,25 @@ const passed = results.filter((r) => r.ok).length;
 // Summary table: one line per shot, then the tally.
 const nameWidth = Math.max(4, ...results.map((r) => r.name.length));
 console.log('');
-console.log(`${'shot'.padEnd(nameWidth)}  ${'bytes'.padStart(8)}  ${'colours'.padStart(8)}  result`);
+console.log(`${'shot'.padEnd(nameWidth)}  ${'bytes'.padStart(8)}  ${'colours'.padStart(8)}  ${'size'.padStart(9)}  result`);
 for (const r of results) {
   console.log(
-    `${r.name.padEnd(nameWidth)}  ${String(r.bytes || '-').padStart(8)}  ${String(r.colours || '-').padStart(8)}  ${r.ok ? 'PASS' : 'FAIL'}`,
+    `${r.name.padEnd(nameWidth)}  ${String(r.bytes || '-').padStart(8)}  ${String(r.colours || '-').padStart(8)}  ${String(r.dims || '-').padStart(9)}  ${r.ok ? 'PASS' : 'FAIL'}`,
   );
 }
 console.log(`${passed}/${results.length} shots passed`);
 
-if (passed !== results.length) process.exitCode = 2;
+// The gallery is a fixed set, not whatever happened to render: a run that wrote a different number
+// of frames than the entry expects would submit a mismatched set without anything looking wrong.
+const shipped = await readdir(OUT);
+const jpegs = shipped.filter((f) => !f.startsWith('.') && /\.jpe?g$/i.test(f)).sort();
+const countOk = EXPECTED_SHOTS.includes(jpegs.length);
+console.log(`${jpegs.length} jpeg(s) in ${OUT}: ${jpegs.join(', ') || 'none'}`);
+if (!countOk) {
+  console.log(`FAIL: expected ${EXPECTED_SHOTS.join(' or ')} screenshots, found ${jpegs.length}`);
+}
+
+if (passed !== results.length || !countOk) process.exitCode = 2;
 
 await browser.close();
 server.close();
