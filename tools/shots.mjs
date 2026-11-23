@@ -87,6 +87,20 @@ page.on('pageerror', (e) => {
 for (const shot of SHOTS) {
   const url = `${base}${shot.query}`;
   await page.goto(url, { waitUntil: 'load' });
+  // Settle guard: the first frame can be painted into a zero-sized canvas while the layout is still
+  // resolving, which screenshots as a blank panel. Wait for the canvas to actually have area first.
+  try {
+    await page.waitForFunction(
+      () => {
+        const c = document.getElementById('screen');
+        return !!c && c.width > 0 && c.height > 0 && c.clientWidth > 0 && c.clientHeight > 0;
+      },
+      null,
+      { timeout: 30000 },
+    );
+  } catch {
+    console.log(`${shot.name}: canvas never reached a non-zero size`);
+  }
   // Wait for the module to boot and the scene to settle, then one more beat for the fade.
   try {
     await page.waitForFunction(() => window.__shotReady === true, null, { timeout: 30000 });
@@ -105,11 +119,14 @@ for (const shot of SHOTS) {
 }
 
 // A blank-frame check: each JPEG is decoded, its mean brightness and spread sampled, so a broken
-// render is caught here rather than by eye.
+// render is caught here rather than by eye. A real frame of this scene is well over 40 KB; anything
+// smaller means the canvas was empty or the capture fired early, so the shot is a hard failure.
+const MIN_BYTES = 40000;
+let failed = 0;
 for (const shot of SHOTS) {
   const path = join(OUT, shot.name);
   const stat = await readFile(path);
-  const uniform = stat.length < 9000;
+  const tooSmall = stat.length < MIN_BYTES;
   const png = await page.evaluate(async (b64) => {
     const img = new Image();
     img.src = `data:image/jpeg;base64,${b64}`;
@@ -128,10 +145,18 @@ for (const shot of SHOTS) {
     }
     return { mean: sum / (d.length / 4), colours: seen.size };
   }, stat.toString('base64'));
-  const ok = !uniform && png.mean > 6 && png.mean < 250 && png.colours > 40;
-  console.log(`${shot.name}: ${stat.length} bytes, ${png.colours} colours, mean ${png.mean.toFixed(1)} ${ok ? 'OK' : 'SUSPECT'}`);
-  if (!ok) process.exitCode = 3;
+  const flat = png.mean <= 6 || png.mean >= 250 || png.colours <= 40;
+  const ok = !tooSmall && !flat;
+  const why = tooSmall ? `under ${MIN_BYTES} bytes` : flat ? 'flat or blown-out frame' : 'sized and varied';
+  console.log(
+    `${shot.name}: ${ok ? 'PASS' : 'FAIL'} - ${stat.length} bytes, ${png.colours} colours, mean ${png.mean.toFixed(1)} (${why})`,
+  );
+  if (!ok) {
+    failed += 1;
+    process.exitCode = 2;
+  }
 }
+console.log(`${SHOTS.length - failed}/${SHOTS.length} shots passed`);
 
 await browser.close();
 server.close();
