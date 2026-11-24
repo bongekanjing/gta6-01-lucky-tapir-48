@@ -1151,20 +1151,21 @@ function drawPlayer(ctx, world, view, t) {
     ctx.restore();
     return;
   }
-  // The invulnerability flicker.
+  // The invulnerability flicker: the body blinks, its ground cue does not.
   const blink = p.invuln > 0 && Math.sin(p.invuln * 60) > 0.2;
   ctx.save();
   ctx.translate(p.x, p.y);
-  // A spotlight ring on the pavement, under everything else: this is what the eye catches
-  // first among the crowd, so the player is findable in one glance.
-  const ringPulse = 1 + Math.sin(t * 3.4) * 0.06;
-  const ringGlow = ctx.createRadialGradient(0, 2, 4, 0, 2, 22 * ringPulse);
-  ringGlow.addColorStop(0, 'rgba(255,194,74,0.30)');
-  ringGlow.addColorStop(0.55, 'rgba(255,194,74,0.14)');
-  ringGlow.addColorStop(1, 'rgba(255,194,74,0)');
-  ctx.fillStyle = ringGlow;
+  // The ground cue is laid down first and outside the blink, so the player can always be found in
+  // a crowd — including in the half-second after a respawn. A soft warm glow under a crisp ring:
+  // the glow catches the eye at a glance, the ring pins the exact spot.
+  const cuePulse = 1 + Math.sin(t * 3.4) * 0.06;
+  const cueGlow = ctx.createRadialGradient(0, 2, 4, 0, 2, 22 * cuePulse);
+  cueGlow.addColorStop(0, 'rgba(255,194,74,0.30)');
+  cueGlow.addColorStop(0.55, 'rgba(255,194,74,0.14)');
+  cueGlow.addColorStop(1, 'rgba(255,194,74,0)');
+  ctx.fillStyle = cueGlow;
   ctx.beginPath();
-  ctx.ellipse(0, 2, 22 * ringPulse, 14 * ringPulse, 0, 0, Math.PI * 2);
+  ctx.ellipse(0, 2, 22 * cuePulse, 14 * cuePulse, 0, 0, Math.PI * 2);
   ctx.fill();
   ctx.strokeStyle = '#FFC24A';
   ctx.lineWidth = 3;

@@ -1,13 +1,13 @@
-// Screenshot rig for SOLARA VICE.
+// Shot rig for SOLARA VICE.
 //
-// The rig serves game/ over a loopback HTTP server, points a headless Chromium at three staged
-// game URLs, and writes the JPEG each scene produces. There is no compositing or retouching: the
-// page runs the game's own renderer with its autopilot for that scene, and the browser captures
-// whatever is actually on the canvas.
+// Three scenes, three JPEGs, no retouching. The rig stands up a read-only HTTP server over game/,
+// drives a headless Chromium through each staged `?shot=` URL, lets the game's own autopilot reach
+// its settled frame, and captures exactly what the canvas is showing. If any part of that chain
+// misbehaves the run fails loudly instead of shipping a picture nobody should see.
 //
-// Every frame is inspected before it reaches the disk. A scene that never signals readiness, a
-// capture that is blank or off-spec, or a page-level error all count as failures and the process
-// exits 2 — a plausible-looking but wrong gallery is worse than a loud failure.
+// Failure is the default. A scene that never signals readiness, a capture that is blank, flat,
+// over-weight or the wrong shape, and any page-level exception all mark the shot FAIL, which makes
+// the process exit 2.
 //
 // Usage: node tools/shots.mjs [--out <dir>]
 
@@ -18,294 +18,332 @@ import { basename, extname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from '/root/makefun/shotenv/node_modules/playwright-core/index.mjs';
 
-// ---------------------------------------------------------------- configuration
+// ================================================================ the run's knobs
 
-const PROJECT = fileURLToPath(new URL('..', import.meta.url));
-const GAME_ROOT = resolve(PROJECT, 'game');
+const PROJECT_DIR = fileURLToPath(new URL('..', import.meta.url));
+const WEB_ROOT = resolve(PROJECT_DIR, 'game');
 
-const argOut = process.argv.indexOf('--out');
-const OUT_DIR = resolve(PROJECT, argOut === -1 ? 'screenshots' : process.argv[argOut + 1]);
+/** `--out <dir>` renames the gallery folder; the default is the one the entry ships. */
+function outputFolder() {
+  const flag = process.argv.indexOf('--out');
+  const value = flag === -1 ? 'screenshots' : process.argv[flag + 1];
+  return resolve(PROJECT_DIR, value || 'screenshots');
+}
+const GALLERY_DIR = outputFolder();
 
-// The browser is taken from the environment when the harness provides one, otherwise from the
-// tool cache on this box.
-const CHROME = process.env.MAKEFUN_CHROME || '/root/.hermes/tools/chromium-1208/chrome-linux64/chrome';
+/** The harness may hand us a browser; otherwise fall back to the copy cached on this box. */
+const BROWSER_BIN = process.env.MAKEFUN_CHROME || '/root/.hermes/tools/chromium-1208/chrome-linux64/chrome';
 
-const VIEWPORT = { width: 1280, height: 720 };
+const FRAME = { width: 1280, height: 720 };
 
-// A frame must be big enough and varied enough to be a real scene rather than an empty canvas.
-const MIN_BYTES = 40000;
-const MIN_COLOURS = 200;
-
-// The gate's own limits on a submitted frame.
-const MAX_BYTES = 262144;
-const MAX_LONG_SIDE = 1280;
-const MIN_SHORT_SIDE = 480;
-
-// The entry ships three frames; four is the competition cap. Anything else means the rig and the
-// entry have drifted apart.
-const ALLOWED_COUNTS = [3, 4];
-
-/**
- * The gallery, in submission order. Chase first: it puts the most systems (driving, pursuit,
- * wanted stars, live objective) into one frame.
- *
- * `ready` is how long the scene may take to raise window.__shotReady, `settle` is the extra hold
- * once it does, so the fade-in and the HUD have finished animating before the shutter.
- */
-const SHOTS = [
-  { name: '1-chase.jpg', query: '?shot=chase&seed=1', ready: 30000, settle: 2200 },
-  { name: '2-drive.jpg', query: '?shot=drive&seed=1', ready: 30000, settle: 1800 },
-  { name: '3-mission.jpg', query: '?shot=mission&seed=1', ready: 30000, settle: 1800 },
-];
-
-const CONTENT_TYPES = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.mjs': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
-  '.woff2': 'font/woff2',
+// A real city frame is heavy and busy. These are the floors that separate "the game drew something"
+// from "the canvas was empty when the shutter opened".
+const FLOOR = {
+  bytes: 40000,
+  colours: 200,
 };
 
-// ---------------------------------------------------------------- static server
+// The gate's ceilings on a submitted frame, checked here so a frame it would reject never lands.
+const CEILING = {
+  bytes: 262144,
+  longSide: 1280,
+  shortSide: 480,
+};
 
-/** A read-only file server rooted at game/, with traversal refused. */
-function serveGame() {
-  const server = createServer(async (req, res) => {
+// Three frames ship; four is the competition's cap. Any other count means the rig and the entry
+// have drifted apart, which is a failure rather than a smaller gallery.
+const LEGAL_COUNTS = [3, 4];
+
+/**
+ * The gallery, in the order it is submitted. The chase goes first because it puts the most systems
+ * in one frame: traffic, pursuit, the wanted stars and a live objective.
+ *
+ * `readyMs` is the budget for the scene to raise window.__shotReady; `settleMs` is the extra hold
+ * afterwards so the fade-in and the HUD have stopped animating before the shutter.
+ */
+const SCENES = [
+  { name: '1-chase.jpg', query: '?shot=chase&seed=1', readyMs: 30000, settleMs: 2200 },
+  { name: '2-drive.jpg', query: '?shot=drive&seed=1', readyMs: 30000, settleMs: 1800 },
+  { name: '3-mission.jpg', query: '?shot=mission&seed=1', readyMs: 30000, settleMs: 1800 },
+];
+
+const CONTENT_TYPE = new Map([
+  ['.html', 'text/html; charset=utf-8'],
+  ['.js', 'text/javascript; charset=utf-8'],
+  ['.mjs', 'text/javascript; charset=utf-8'],
+  ['.css', 'text/css; charset=utf-8'],
+  ['.json', 'application/json; charset=utf-8'],
+  ['.png', 'image/png'],
+  ['.jpg', 'image/jpeg'],
+  ['.jpeg', 'image/jpeg'],
+  ['.svg', 'image/svg+xml'],
+  ['.ico', 'image/x-icon'],
+  ['.woff2', 'font/woff2'],
+]);
+
+// ================================================================ static server
+
+/**
+ * Read-only file server rooted at game/. Anything that resolves outside the root, by encoding or by
+ * traversal, is refused with 403; a path that simply is not there answers 404, which the favicon
+ * request earns every run.
+ */
+function openStaticServer() {
+  const server = createServer(async (request, response) => {
     try {
-      const { pathname } = new URL(req.url, 'http://127.0.0.1');
-      let rel;
+      const { pathname } = new URL(request.url, 'http://127.0.0.1');
+      let requested;
       try {
-        rel = decodeURIComponent(pathname);
+        requested = decodeURIComponent(pathname);
       } catch {
-        rel = pathname;
+        requested = pathname; // a malformed escape is not worth a 403 of its own
       }
-      const cleaned = normalize(rel).replace(/^([/\\]|\.\.[/\\])+/, '');
-      const file = join(GAME_ROOT, cleaned || 'index.html');
-      if (file !== GAME_ROOT && !file.startsWith(GAME_ROOT + sep)) {
-        res.writeHead(403).end('forbidden');
+      const stripped = normalize(requested).replace(/^([/\\]|\.\.[/\\])+/, '');
+      const file = join(WEB_ROOT, stripped || 'index.html');
+      if (file !== WEB_ROOT && !file.startsWith(WEB_ROOT + sep)) {
+        response.writeHead(403).end('forbidden');
         return;
       }
       const body = await readFile(file);
-      res.writeHead(200, { 'content-type': CONTENT_TYPES[extname(file).toLowerCase()] ?? 'application/octet-stream' });
-      res.end(body);
+      response.writeHead(200, {
+        'content-type': CONTENT_TYPE.get(extname(file).toLowerCase()) ?? 'application/octet-stream',
+      });
+      response.end(body);
     } catch {
-      res.writeHead(404).end('not found');
+      response.writeHead(404).end('not found');
     }
   });
-  return new Promise((done) => server.listen(0, '127.0.0.1', () => done(server)));
+  return new Promise((ready) => server.listen(0, '127.0.0.1', () => ready(server)));
 }
 
-// ---------------------------------------------------------------- frame inspection
+// ================================================================ frame audit
 
 /**
- * Decode a JPEG inside the page and sample it: the true pixel dimensions of the decoded image,
- * a mean luminance, and how many distinct 8-bit RGB triples survive a downscale.
+ * Decode a JPEG inside the page and describe it: the dimensions the decoded image actually has
+ * (not the viewport we asked for), an average luminance, and the number of distinct 8-bit RGB
+ * triples left after a downscale to 320x180.
  */
-function measureFrame(page, buffer) {
-  return page.evaluate(async (b64) => {
-    const img = new Image();
-    img.src = `data:image/jpeg;base64,${b64}`;
-    await img.decode();
-    const canvas = document.createElement('canvas');
-    canvas.width = 320;
-    canvas.height = 180;
-    const g = canvas.getContext('2d', { willReadFrequently: true });
-    g.drawImage(img, 0, 0, canvas.width, canvas.height);
-    const px = g.getImageData(0, 0, canvas.width, canvas.height).data;
-    const colours = new Set();
-    let luma = 0;
-    for (let i = 0; i < px.length; i += 4) {
-      luma += (px[i] + px[i + 1] + px[i + 2]) / 3;
-      colours.add((px[i] << 16) | (px[i + 1] << 8) | px[i + 2]);
+function describeFrame(page, buffer) {
+  return page.evaluate(async (base64) => {
+    const probe = new Image();
+    probe.src = `data:image/jpeg;base64,${base64}`;
+    await probe.decode();
+
+    const scratch = document.createElement('canvas');
+    scratch.width = 320;
+    scratch.height = 180;
+    const g = scratch.getContext('2d', { willReadFrequently: true });
+    g.drawImage(probe, 0, 0, scratch.width, scratch.height);
+    const pixels = g.getImageData(0, 0, scratch.width, scratch.height).data;
+
+    const palette = new Set();
+    let luminance = 0;
+    for (let i = 0; i < pixels.length; i += 4) {
+      luminance += (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
+      palette.add((pixels[i] << 16) | (pixels[i + 1] << 8) | pixels[i + 2]);
     }
+
     return {
-      width: img.naturalWidth,
-      height: img.naturalHeight,
-      mean: luma / (px.length / 4),
-      colours: colours.size,
+      width: probe.naturalWidth,
+      height: probe.naturalHeight,
+      mean: luminance / (pixels.length / 4),
+      colours: palette.size,
     };
   }, buffer.toString('base64'));
 }
 
 /**
- * Apply every gate rule to the captured bytes, in memory, and return the measurements plus a list
- * of complaints. An empty list means the frame may be written.
+ * Judge the captured bytes while they are still in memory. Returns the measurements plus the list
+ * of complaints; an empty list means the frame is fit to write. A rejected frame is never written,
+ * so no plausible-looking JPEG is left behind for the entry to pick up.
  */
-async function vet(page, buffer) {
+async function auditFrame(page, buffer) {
   const bytes = buffer.length;
-  const sample = await measureFrame(page, buffer);
-  const longSide = Math.max(sample.width, sample.height);
-  const shortSide = Math.min(sample.width, sample.height);
-  const complaints = [];
-  if (bytes < MIN_BYTES) complaints.push(`${bytes}B is under the ${MIN_BYTES}B floor`);
-  if (bytes > MAX_BYTES) complaints.push(`${bytes}B is over the ${MAX_BYTES}B ceiling`);
-  if (sample.colours < MIN_COLOURS) complaints.push(`only ${sample.colours} distinct colours`);
-  if (longSide > MAX_LONG_SIDE) complaints.push(`long side ${longSide} exceeds ${MAX_LONG_SIDE}`);
-  if (shortSide < MIN_SHORT_SIDE) complaints.push(`short side ${shortSide} below ${MIN_SHORT_SIDE}`);
-  if (sample.mean <= 6) complaints.push(`frame is black (mean ${sample.mean.toFixed(1)})`);
-  if (sample.mean >= 250) complaints.push(`frame is white (mean ${sample.mean.toFixed(1)})`);
+  const seen = await describeFrame(page, buffer);
+  const longSide = Math.max(seen.width, seen.height);
+  const shortSide = Math.min(seen.width, seen.height);
+  const faults = [];
+
+  if (bytes < FLOOR.bytes) faults.push(`${bytes}B is under the ${FLOOR.bytes}B floor`);
+  if (bytes > CEILING.bytes) faults.push(`${bytes}B is over the ${CEILING.bytes}B ceiling`);
+  if (seen.colours < FLOOR.colours) faults.push(`only ${seen.colours} distinct colours`);
+  if (longSide > CEILING.longSide) faults.push(`long side ${longSide} exceeds ${CEILING.longSide}`);
+  if (shortSide < CEILING.shortSide) faults.push(`short side ${shortSide} below ${CEILING.shortSide}`);
+  if (seen.mean <= 6) faults.push(`frame is black (mean ${seen.mean.toFixed(1)})`);
+  if (seen.mean >= 250) faults.push(`frame is white (mean ${seen.mean.toFixed(1)})`);
+
   return {
     bytes,
-    colours: sample.colours,
-    dims: `${sample.width}x${sample.height}`,
-    complaints,
+    colours: seen.colours,
+    dims: `${seen.width}x${seen.height}`,
+    faults,
   };
 }
 
-// ---------------------------------------------------------------- main
+// ================================================================ one scene
 
-if (!existsSync(CHROME)) {
-  console.error(`no chromium at ${CHROME} (set MAKEFUN_CHROME to override)`);
+/**
+ * Load a scene and hold the shutter until it is worth taking: the canvas must have real area, the
+ * scene must have declared itself settled, and then the fades get their extra beat. Every wait that
+ * expires throws, because a capture taken too early would be a blank.
+ */
+async function settleScene(page, url, scene) {
+  await page.goto(url, { waitUntil: 'load' });
+
+  // The first paint can land in a zero-sized canvas while layout is still resolving.
+  try {
+    await page.waitForFunction(
+      () => {
+        const canvas = document.getElementById('screen');
+        return !!canvas && canvas.width > 0 && canvas.height > 0 && canvas.clientWidth > 0 && canvas.clientHeight > 0;
+      },
+      null,
+      { timeout: 30000 },
+    );
+  } catch {
+    throw new Error('canvas never reached a non-zero size within 30000ms');
+  }
+
+  // The scene itself knows when its frame is representative; we do not guess on its behalf.
+  try {
+    await page.waitForFunction(() => window.__shotReady === true, null, { timeout: scene.readyMs });
+  } catch {
+    throw new Error(`__shotReady never arrived within ${scene.readyMs}ms`);
+  }
+
+  await page.waitForTimeout(scene.settleMs);
+}
+
+/**
+ * Capture one scene and write it only if it passes the audit. Throws on anything that would make
+ * the frame unshippable; the caller turns that into a FAIL row and deletes the target.
+ */
+async function captureScene(page, scene, origin, target) {
+  await settleScene(page, `${origin}${scene.query}`, scene);
+
+  const canvas = await page.evaluate(() => {
+    const element = document.getElementById('screen');
+    return { w: element?.width ?? 0, h: element?.height ?? 0, info: window.__shotInfo ?? null };
+  });
+  console.log(`${scene.name} __shotInfo ${JSON.stringify(canvas)}`);
+
+  const frame = await page.screenshot({
+    type: 'jpeg',
+    quality: 88,
+    clip: { x: 0, y: 0, width: FRAME.width, height: FRAME.height },
+  });
+
+  const audit = await auditFrame(page, frame);
+  if (audit.faults.length) throw new Error(`capture rejected: ${audit.faults.join('; ')}`);
+
+  await writeFile(target, frame);
+  const onDisk = (await stat(target)).size;
+  if (onDisk !== frame.length) throw new Error(`wrote ${onDisk}B, expected ${frame.length}B`);
+
+  return audit;
+}
+
+// ================================================================ main
+
+if (!existsSync(BROWSER_BIN)) {
+  console.error(`no chromium at ${BROWSER_BIN} (set MAKEFUN_CHROME to override)`);
   process.exit(1);
 }
 
-// Nothing dot-prefixed may be produced: a marker file would be submitted as if it were a shot.
-for (const shot of SHOTS) {
-  if (basename(shot.name).startsWith('.')) {
-    console.error(`refusing to write dot-file "${shot.name}" into ${OUT_DIR}`);
-    process.exit(1);
-  }
+// A dot-named file would be handed in as if it were a screenshot, so the rig will not produce one.
+const dotTarget = SCENES.find((scene) => basename(scene.name).startsWith('.'));
+if (dotTarget) {
+  console.error(`refusing to write dot-file "${dotTarget.name}" into ${GALLERY_DIR}`);
+  process.exit(1);
 }
 
-await mkdir(OUT_DIR, { recursive: true });
+await mkdir(GALLERY_DIR, { recursive: true });
 
-const server = await serveGame();
+const server = await openStaticServer();
 const origin = `http://127.0.0.1:${server.address().port}/index.html`;
 
 const browser = await chromium.launch({
-  executablePath: CHROME,
+  executablePath: BROWSER_BIN,
   args: ['--no-sandbox', '--disable-dev-shm-usage', '--force-device-scale-factor=1', '--hide-scrollbars', '--disable-lcd-text'],
 });
-const page = await browser.newPage({ viewport: VIEWPORT, deviceScaleFactor: 1 });
+const page = await browser.newPage({ viewport: FRAME, deviceScaleFactor: 1 });
 
-// Anything the page reports is collected; a resource 404 (a missing favicon) is the only noise we
-// are willing to ignore.
-const pageErrors = [];
-page.on('console', (msg) => {
-  if (msg.type() !== 'error') return;
-  pageErrors.push(msg.text());
-  console.log('PAGE ERROR:', msg.text());
+// Collect everything the page complains about. A missing favicon is the one piece of noise we
+// accept; the filter that decides that lives at the end, next to the tally.
+const complaints = [];
+page.on('console', (message) => {
+  if (message.type() !== 'error') return;
+  complaints.push(message.text());
+  console.log('PAGE ERROR:', message.text());
 });
-page.on('pageerror', (err) => {
-  pageErrors.push(err.message);
-  console.log('PAGE EXCEPTION:', err.message);
+page.on('pageerror', (error) => {
+  complaints.push(error.message);
+  console.log('PAGE EXCEPTION:', error.message);
 });
 
 const rows = [];
 
-for (const shot of SHOTS) {
-  const target = join(OUT_DIR, shot.name);
-  const row = { name: shot.name, bytes: 0, colours: 0, dims: '-', ok: false };
+for (const scene of SCENES) {
+  const target = join(GALLERY_DIR, scene.name);
+  const row = { name: scene.name, bytes: 0, colours: 0, dims: '-', ok: false };
   rows.push(row);
 
+  // Belt and braces: the folder may have been renamed into a dot-name via --out.
   if (basename(target).startsWith('.')) {
-    console.log(`${shot.name}: FAILED — dot-file target refused`);
+    console.log(`${scene.name}: FAILED — dot-file target refused`);
     continue;
   }
 
-  // A stale frame from an earlier run must never stand in for this one.
+  // A leftover from an earlier run must never stand in for the frame this run is meant to make.
   await rm(target, { force: true });
 
   try {
-    await page.goto(`${origin}${shot.query}`, { waitUntil: 'load' });
-
-    // The first paint can land in a zero-sized canvas while layout settles; wait for area.
-    let sized = true;
-    try {
-      await page.waitForFunction(
-        () => {
-          const c = document.getElementById('screen');
-          return !!c && c.width > 0 && c.height > 0 && c.clientWidth > 0 && c.clientHeight > 0;
-        },
-        null,
-        { timeout: 30000 },
-      );
-    } catch {
-      sized = false;
-    }
-    if (!sized) throw new Error('canvas never reached a non-zero size within 30000ms');
-
-    // The scene itself declares when it has settled. Without that signal a capture would be a
-    // lottery, so a timeout is a hard failure for this shot.
-    let ready = true;
-    try {
-      await page.waitForFunction(() => window.__shotReady === true, null, { timeout: shot.ready });
-    } catch {
-      ready = false;
-    }
-    if (!ready) throw new Error(`__shotReady never arrived within ${shot.ready}ms`);
-
-    // One more beat for the fade and HUD animations.
-    await page.waitForTimeout(shot.settle);
-
-    const info = await page.evaluate(() => {
-      const c = document.getElementById('screen');
-      return { w: c?.width ?? 0, h: c?.height ?? 0, info: window.__shotInfo ?? null };
-    });
-    console.log(shot.name, '__shotInfo', JSON.stringify(info));
-
-    const frame = await page.screenshot({
-      type: 'jpeg',
-      quality: 88,
-      clip: { x: 0, y: 0, width: VIEWPORT.width, height: VIEWPORT.height },
-    });
-
-    // Vetted in memory: a rejected frame is never written, so no half-good JPEG can ship.
-    const verdict = await vet(page, frame);
-    row.bytes = verdict.bytes;
-    row.colours = verdict.colours;
-    row.dims = verdict.dims;
-    if (verdict.complaints.length) throw new Error(`capture rejected: ${verdict.complaints.join('; ')}`);
-
-    await writeFile(target, frame);
-    const written = (await stat(target)).size;
-    if (written !== frame.length) throw new Error(`wrote ${written}B, expected ${frame.length}B`);
-  } catch (err) {
+    const audit = await captureScene(page, scene, origin, target);
+    row.bytes = audit.bytes;
+    row.colours = audit.colours;
+    row.dims = audit.dims;
+  } catch (error) {
     await rm(target, { force: true });
-    console.log(`${shot.name}: FAILED — ${err instanceof Error ? err.message : String(err)}`);
+    console.log(`${scene.name}: FAILED — ${error instanceof Error ? error.message : String(error)}`);
     continue;
   }
 
   row.ok = true;
-  console.log(`${shot.name}: ${row.bytes} bytes, ${row.colours} colours, ${row.dims}, PASS`);
+  console.log(`${scene.name}: ${row.bytes} bytes, ${row.colours} colours, ${row.dims}, PASS`);
 }
 
 await browser.close();
 server.close();
 
-// ---------------------------------------------------------------- report
+// ================================================================ report
 
-const passed = rows.filter((r) => r.ok).length;
-const nameCol = Math.max(4, ...rows.map((r) => r.name.length));
+const passed = rows.filter((row) => row.ok).length;
+const nameWidth = Math.max(4, ...rows.map((row) => row.name.length));
 
 console.log('');
-console.log(`${'shot'.padEnd(nameCol)}  ${'bytes'.padStart(8)}  ${'colours'.padStart(8)}  ${'size'.padStart(9)}  result`);
-for (const r of rows) {
+console.log(`${'shot'.padEnd(nameWidth)}  ${'bytes'.padStart(8)}  ${'colours'.padStart(8)}  ${'size'.padStart(9)}  result`);
+for (const row of rows) {
   console.log(
-    `${r.name.padEnd(nameCol)}  ${String(r.bytes || '-').padStart(8)}  ${String(r.colours || '-').padStart(8)}  ${String(r.dims).padStart(9)}  ${r.ok ? 'PASS' : 'FAIL'}`,
+    `${row.name.padEnd(nameWidth)}  ${String(row.bytes || '-').padStart(8)}  ${String(row.colours || '-').padStart(8)}  ${String(row.dims).padStart(9)}  ${row.ok ? 'PASS' : 'FAIL'}`,
   );
 }
 console.log(`${passed}/${rows.length} shots passed`);
 
-// The gallery is a fixed size, so count what actually landed on disk, not what we intended.
-const onDisk = (await readdir(OUT_DIR)).filter((f) => !f.startsWith('.') && /\.jpe?g$/i.test(f)).sort();
-const countOk = ALLOWED_COUNTS.includes(onDisk.length);
-console.log(`${onDisk.length} jpeg(s) in ${OUT_DIR}: ${onDisk.join(', ') || 'none'}`);
-if (!countOk) console.log(`FAIL: expected ${ALLOWED_COUNTS.join(' or ')} screenshots, found ${onDisk.length}`);
+// Count what actually landed in the gallery rather than what we meant to write: the entry ships a
+// fixed set, and a mismatch should be visible in the log.
+const shipped = (await readdir(GALLERY_DIR)).filter((file) => !file.startsWith('.') && /\.jpe?g$/i.test(file)).sort();
+const countFine = LEGAL_COUNTS.includes(shipped.length);
+console.log(`${shipped.length} jpeg(s) in ${GALLERY_DIR}: ${shipped.join(', ') || 'none'}`);
+if (!countFine) console.log(`FAIL: expected ${LEGAL_COUNTS.join(' or ')} screenshots, found ${shipped.length}`);
 
-if (passed !== rows.length || !countOk) process.exitCode = 2;
+if (passed !== rows.length || !countFine) process.exitCode = 2;
 
-const realErrors = pageErrors.filter((e) => !/404|Failed to load resource/i.test(e));
-if (realErrors.length) {
-  console.log(`\n${realErrors.length} page error(s).`);
+// A resource 404 for a missing favicon is noise; every other complaint is a real failure.
+const realComplaints = complaints.filter((entry) => !/404|Failed to load resource/i.test(entry));
+if (realComplaints.length) {
+  console.log(`\n${realComplaints.length} page error(s).`);
   process.exitCode = 2;
 } else {
   console.log('0 page exceptions');
 }
-console.log(`screenshots written to ${OUT_DIR}`);
+console.log(`screenshots written to ${GALLERY_DIR}`);
