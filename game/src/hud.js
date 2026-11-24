@@ -538,13 +538,21 @@ function drawHints(ctx, world) {
       ctx.fillText(label, x + 36, y + 15.5);
     }
   }
-  // A small controls strip, bottom left of the weapon panel.
+  // A small controls strip, bottom left of the weapon panel: dark plate so it stays legible on
+  // bright pavement.
   if (world.showControls) {
+    const text = 'WASD move · SHIFT sprint · F enter car · LMB fire · 1/2/3 weapon · ESC pause';
+    const x = 24;
+    const y = VIEW.h - 220;
+    ctx.save();
     ctx.font = '600 10px system-ui, sans-serif';
-    ctx.fillStyle = 'rgba(246,240,226,0.42)';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'alphabetic';
-    ctx.fillText('WASD move · SHIFT sprint · F enter car · LMB fire · 1/2/3 weapon · ESC pause', 24, VIEW.h - 220);
+    const w = ctx.measureText(text).width + 20;
+    fillRoundRect(ctx, x, y - 13, w, 26, 7, 'rgba(12,14,18,0.62)');
+    ctx.fillStyle = '#F2EEE4';
+    ctx.fillText(text, x + 10, y);
+    ctx.restore();
   }
 }
 
@@ -581,11 +589,14 @@ function drawToast(ctx, world) {
 function drawBigMessage(ctx, world) {
   if (world.bigMessageTimer <= 0 || !world.bigMessage) return;
   const k = clamp(world.bigMessageTimer / 0.4, 0, 1);
+  // The lockdown banner is a passing note, not a headline: keep it quiet so the city stays the
+  // subject.
+  const quiet = /LOCKDOWN/i.test(world.bigMessage);
   ctx.save();
-  ctx.globalAlpha = k;
+  ctx.globalAlpha = k * (quiet ? 0.55 : 1);
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.font = '900 46px system-ui, sans-serif';
+  ctx.font = quiet ? '900 30px system-ui, sans-serif' : '900 46px system-ui, sans-serif';
   ctx.fillStyle = 'rgba(10,8,8,0.55)';
   ctx.fillText(world.bigMessage, VIEW.w / 2 + 2, 214 + 2);
   const g = ctx.createLinearGradient(0, 180, 0, 240);

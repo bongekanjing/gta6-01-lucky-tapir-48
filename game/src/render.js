@@ -9,6 +9,7 @@
 import { CAR, LIGHT, PALETTE, VIEW, WEAPONS } from './config.js';
 import { cameraOffset, screenToWorld, viewRect } from './camera.js';
 import { carCorners } from './vehicles.js';
+import { missionMarker } from './missions.js';
 import { alpha, clamp, dist, fillRoundRect, hash01, lerp, money, shade, starPath, strokeRoundRect } from './util.js';
 
 /** The sun direction on screen, for shadow offsets and the sky's glow. */
@@ -119,6 +120,7 @@ function drawWorld(ctx, world, state) {
   drawPeds(ctx, world, view, state.time);
   drawCars(ctx, world, view, state.time);
   drawPlayer(ctx, world, view, state.time);
+  drawObjectiveMarker(ctx, world, view, state.time);
   drawBullets(ctx, world, view);
   drawParticles(ctx, world, view);
   drawBuildingTops(ctx, world, view);
@@ -1258,6 +1260,159 @@ function drawPlayer(ctx, world, view, t) {
 }
 
 // ---------------------------------------------------------------- bullets and particles
+
+// ---------------------------------------------------------------- objective marker
+
+/**
+ * The active mission's objective, painted in the world. A gold diamond with a soft halo and a slow
+ * shaft of light when the target is in frame; a gold arrow pinned to the edge of the view, aimed at
+ * it, when it is not. Sizes are divided by the camera zoom so the marker keeps the same apparent
+ * size however far the view has pulled back.
+ *
+ * Every access is defensive: no mission, no marker, or a malformed marker simply draws nothing.
+ */
+function drawObjectiveMarker(ctx, world, view, t) {
+  const target = safeObjective(world);
+  if (!target) return;
+  const zoom = Number.isFinite(world?.camera?.zoom) && world.camera.zoom > 0 ? world.camera.zoom : 1;
+  const px = 1 / zoom; // one screen pixel, in world units
+  const cx = Number.isFinite(view?.ox) ? view.ox : world?.camera?.x ?? target.x;
+  const cy = Number.isFinite(view?.oy) ? view.oy : world?.camera?.y ?? target.y;
+  const halfW = VIEW.w / (2 * zoom);
+  const halfH = VIEW.h / (2 * zoom);
+  const dx = target.x - cx;
+  const dy = target.y - cy;
+  const gold = PALETTE.gold ?? '#f0b73f';
+
+  // Just inside the letterbox, so an edge arrow never gets clipped.
+  const padX = Math.max(0, halfW - 42 * px);
+  const padY = Math.max(0, halfH - 42 * px);
+  const onScreen = Math.abs(dx) <= padX && Math.abs(dy) <= padY;
+
+  ctx.save();
+  if (onScreen) {
+    drawMarkerBeacon(ctx, target.x, target.y, t, px, gold);
+  } else {
+    drawEdgeArrow(ctx, cx, cy, dx, dy, padX, padY, t, px, gold);
+  }
+  ctx.restore();
+}
+
+/** The current objective position, or null when there is nothing sane to point at. */
+function safeObjective(world) {
+  if (!world) return null;
+  let marker = null;
+  try {
+    marker = missionMarker(world);
+  } catch {
+    return null;
+  }
+  if (!marker || typeof marker !== 'object') return null;
+  const x = Number(marker.x);
+  const y = Number(marker.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return { x, y };
+}
+
+/** The in-frame beacon: halo, pulsing diamond, and a shaft that stretches with `t`. */
+function drawMarkerBeacon(ctx, x, y, t, px, gold) {
+  const pulse = 1 + Math.sin(t * 3.1) * 0.14;
+  const half = 13 * px * pulse;
+
+  // The shaft first, so the diamond sits on top of it.
+  const shaft = (30 + Math.sin(t * 2.4) * 11) * px;
+  if (shaft > 2) {
+    const beam = ctx.createLinearGradient(x, y - shaft, x, y);
+    beam.addColorStop(0, 'rgba(255,226,150,0)');
+    beam.addColorStop(0.65, 'rgba(240,183,63,0.42)');
+    beam.addColorStop(1, 'rgba(255,240,196,0.92)');
+    ctx.strokeStyle = beam;
+    ctx.lineWidth = Math.max(1.6, 2.6 * px);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x, y - shaft);
+    ctx.lineTo(x, y - 3 * px);
+    ctx.stroke();
+    // A bright spark riding the top of the shaft.
+    ctx.fillStyle = 'rgba(255,244,208,0.9)';
+    ctx.beginPath();
+    ctx.arc(x, y - shaft, Math.max(1.4, 2.4 * px), 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // The halo: a wide, soft pool of warm light.
+  const halo = ctx.createRadialGradient(x, y, 1, x, y, half * 3.4);
+  halo.addColorStop(0, 'rgba(255,214,120,0.5)');
+  halo.addColorStop(0.45, 'rgba(240,183,63,0.24)');
+  halo.addColorStop(1, 'rgba(240,183,63,0)');
+  ctx.fillStyle = halo;
+  ctx.beginPath();
+  ctx.arc(x, y, half * 3.4, 0, Math.PI * 2);
+  ctx.fill();
+
+  // The diamond: a square turned 45 degrees, dark-edged so it reads against pavement.
+  ctx.beginPath();
+  ctx.moveTo(x, y - half);
+  ctx.lineTo(x + half, y);
+  ctx.lineTo(x, y + half);
+  ctx.lineTo(x - half, y);
+  ctx.closePath();
+  ctx.fillStyle = gold;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(46,32,10,0.65)';
+  ctx.lineWidth = Math.max(1, 1.6 * px);
+  ctx.stroke();
+
+  // A highlight facet on the upper half, so the shape reads at small size.
+  ctx.beginPath();
+  ctx.moveTo(x, y - half);
+  ctx.lineTo(x + half, y);
+  ctx.lineTo(x, y);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(255,246,214,0.6)';
+  ctx.fill();
+}
+
+/** The out-of-frame cue: a gold arrow on the view's edge, aimed at the target. */
+function drawEdgeArrow(ctx, cx, cy, dx, dy, padX, padY, t, px, gold) {
+  const ax = Math.abs(dx);
+  const ay = Math.abs(dy);
+  if (ax < 1e-6 && ay < 1e-6) return;
+  // Slide along the line to the target until it meets the edge of the inset view rect.
+  const kx = ax > 1e-6 ? padX / ax : Infinity;
+  const ky = ay > 1e-6 ? padY / ay : Infinity;
+  const k = Math.min(1, kx, ky);
+  const ex = cx + dx * k;
+  const ey = cy + dy * k;
+  const angle = Math.atan2(dy, dx);
+  const size = 15 * px * (1 + Math.sin(t * 4.2) * 0.07);
+
+  ctx.save();
+  ctx.translate(ex, ey);
+  ctx.rotate(angle);
+
+  // A soft glow behind the head keeps it visible over bright pavement and dark water alike.
+  const glow = ctx.createRadialGradient(0, 0, 1, 0, 0, size * 2.2);
+  glow.addColorStop(0, 'rgba(255,214,120,0.5)');
+  glow.addColorStop(1, 'rgba(240,183,63,0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(0, 0, size * 2.2, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.moveTo(size, 0);
+  ctx.lineTo(-size * 0.7, size * 0.85);
+  ctx.lineTo(-size * 0.25, 0);
+  ctx.lineTo(-size * 0.7, -size * 0.85);
+  ctx.closePath();
+  ctx.fillStyle = gold;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(46,32,10,0.7)';
+  ctx.lineWidth = Math.max(1, 1.5 * px);
+  ctx.stroke();
+  ctx.restore();
+}
 
 function drawBullets(ctx, world, view) {
   for (const b of world.bullets) {
